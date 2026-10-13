@@ -57,7 +57,9 @@ export const make = Effect.fn("PluginModule.make")(function* () {
           ) === "deny"
         )
           return { blocked: true as const }
-        return yield* load(operation, sources, options)
+        // T5: 单个插件的加载受超时隔离约束，超时只让这一个插件失败并被跳过，
+        // supervisor 的顺序循环会继续处理后面的插件，整体不会 hang。
+        return yield* withLoadTimeout(load(operation, sources, options), operation.target)
       }),
     changes: () => Stream.fromPubSub(changes),
   }
@@ -94,6 +96,37 @@ export class LoadError extends Schema.TaggedError<LoadError>()("PluginModule.Loa
   message: Schema.String,
   cause: Schema.optional(Schema.Defect()),
 }) {}
+
+// T5: 单个插件加载的超时阈值（毫秒），覆盖 npm install/resolve + 入口解析 + 动态 import 的全过程。
+// 超过该时间只隔离这一个插件（记为失败并跳过），不阻塞后续插件，也不让整体流程无限等待。
+// 可选覆盖：通过环境变量 OPENCODE_PLUGIN_LOAD_TIMEOUT_MS 设置（仅用运行时内置 process/Number，无新依赖）。
+const PLUGIN_LOAD_TIMEOUT_MS = Number(process.env.OPENCODE_PLUGIN_LOAD_TIMEOUT_MS) || 30_000
+
+// T5: 区分"超时"与"插件自身真实错误"的内部哨兵。只有超时分支会带上它，
+// 真实错误沿 raceFirst 原样向上抛出，因此绝不会被误判成超时。
+const PLUGIN_LOAD_TIMEOUT = Symbol("plugin-load-timeout")
+
+// T5: 为单个插件的加载包裹超时隔离。
+//
+// 语义等价于 Promise.race([实际加载, 超时])：这里用 Effect 侧的 raceFirst（首个 exit 胜出），
+// 因为 npm 安装本身是一个 Effect，没有运行时能把它原地降级成 Promise。
+//
+// 关键前提：底层（npm 安装、动态 import）不接受 AbortSignal，无法真正取消，
+// 所以超时只意味着"不再等待这一个插件"——它按失败处理并被跳过（supervisor 会记入 failures），
+// 后续插件与整体流程继续推进；底层工作仍可能在后台继续占用资源。
+function withLoadTimeout<A, E, R>(effect: Effect.Effect<A, E, R>, target: string): Effect.Effect<A, E | LoadError, R> {
+  const timeout = Effect.sleep(PLUGIN_LOAD_TIMEOUT_MS).pipe(
+    Effect.tap(() => Effect.logWarning({ msg: "plugin load timed out", target, timeout: PLUGIN_LOAD_TIMEOUT_MS })),
+    Effect.andThen(() => Effect.fail(PLUGIN_LOAD_TIMEOUT)),
+  )
+  return Effect.raceFirst(effect, timeout).pipe(
+    Effect.mapError((error) =>
+      error === PLUGIN_LOAD_TIMEOUT
+        ? new LoadError({ message: `Plugin load timed out after ${PLUGIN_LOAD_TIMEOUT_MS}ms: ${target}` })
+        : (error as E),
+    ),
+  )
+}
 
 const load = Effect.fn("PluginModule.load")(function* (
   operation: Extract<ConfigPluginSource.Operation, { type: "add" }>,

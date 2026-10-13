@@ -205,27 +205,36 @@ it.effect("auto compaction estimates current content against the buffered prompt
     const due = (context: SessionContext.Loaded) =>
       compaction.compact({ reason: "auto", context }).pipe(Effect.map((outcome) => outcome.status !== "skipped"))
 
-    // 90% of the input limit, which takes precedence over the context window.
+    // The input limit takes precedence over the context window. A 272k window reserves the largest of 10%
+    // (27.2k), RESERVE_MIN (16k), and 25% of the 128k reply limit (32k), so the ceiling is 240k and auto
+    // compaction becomes due at 90% of it, 216k.
     const inputLimited = { context: 400_000, input: 272_000, output: 128_000 }
-    expect(yield* due(input(244_799, inputLimited))).toBe(false)
-    expect(yield* due(input(244_800, inputLimited))).toBe(true)
+    expect(yield* due(input(215_999, inputLimited))).toBe(false)
+    expect(yield* due(input(216_000, inputLimited))).toBe(true)
     const native = (tokens: number, limit: { context: number; input?: number; output: number } = inputLimited) => {
       const selected = input(tokens, limit)
       return { ...selected, model: { ...selected.model, compaction: { type: "native" as const } } }
     }
-    expect(yield* due(native(244_799))).toBe(false)
-    expect(yield* due(native(244_800))).toBe(true)
+    expect(yield* due(native(215_999))).toBe(false)
+    expect(yield* due(native(216_000))).toBe(true)
     expect(yield* due(native(1_000_000, { context: 0, input: undefined, output: 0 }))).toBe(false)
 
-    // The summary's 16k output limit is more than 10% of a 100k window, so it sets the ceiling.
+    // On a 100k window the reply reserve floors at 20k, more than both 10% (10k) and RESERVE_MIN (16k), so the
+    // ceiling is 80k and the trigger is 72k.
     const contextLimited = { context: 100_000, output: 10_000 }
-    expect(yield* due(input(83_999, contextLimited))).toBe(false)
-    expect(yield* due(input(84_000, contextLimited))).toBe(true)
+    expect(yield* due(input(71_999, contextLimited))).toBe(false)
+    expect(yield* due(input(72_000, contextLimited))).toBe(true)
 
-    // The reply limit does not lower the ceiling.
+    // A reply limit under 80k reserves the 20k floor rather than 25% of itself, so it leaves the ceiling at 80k.
     const outputLimited = { context: 100_000, output: 30_000 }
-    expect(yield* due(input(83_999, outputLimited))).toBe(false)
-    expect(yield* due(input(84_000, outputLimited))).toBe(true)
+    expect(yield* due(input(71_999, outputLimited))).toBe(false)
+    expect(yield* due(input(72_000, outputLimited))).toBe(true)
+
+    // A reply limit over 80k reserves 25% of itself instead, here 32k under the 50k half-window cap, which
+    // lowers the ceiling to 68k and the trigger to 61.2k.
+    const outputHeavy = { context: 100_000, output: 128_000 }
+    expect(yield* due(input(61_199, outputHeavy))).toBe(false)
+    expect(yield* due(input(61_200, outputHeavy))).toBe(true)
 
     const assistant = input(89_000, contextLimited).messages[0]
     const tool = SessionMessage.AssistantTool.make({
@@ -460,7 +469,9 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       "x-opencode-session": parentID,
       "x-opencode-client": "opencode",
     })
-    expect(requests[0]?.generation).toEqual(GenerationOptions.make({ maxTokens: 20_000 }))
+    // The summary request aims at 90% of the 180k ceiling, leaving 38k of the 200k window: more than the 32k
+    // output limit, which the summary now gets in full.
+    expect(requests[0]?.generation).toEqual(GenerationOptions.make({ maxTokens: 32_000 }))
     expect(JSON.stringify(requests[0]?.messages)).toContain("Manual compaction should include this short conversation.")
     expect(JSON.stringify(requests[0]?.messages)).toContain("Use Effect services and generators.")
     expect(JSON.stringify(requests[0]?.messages)).toContain("User shell pwd completed: /project")

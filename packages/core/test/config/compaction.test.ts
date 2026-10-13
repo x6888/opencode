@@ -123,7 +123,10 @@ describe("ConfigCompactionPlugin.Plugin", () => {
         }
         yield* Effect.die(new Error("Timed out waiting for compaction config reload"))
       })
-      expect(yield* due(bufferedInput)).toBe(false)
+      // A 10k buffer leaves a 90k ceiling, and 90% of it is 81k, so 85k of context is due now.
+      expect(yield* due(bufferedInput)).toBe(true)
+      // Under the same 10k buffer 80k stays below the 81k trigger, so it only becomes due once the buffer grows.
+      expect(yield* due(underInput)).toBe(false)
 
       yield* config.setEntries([
         new Document({
@@ -133,7 +136,8 @@ describe("ConfigCompactionPlugin.Plugin", () => {
       ])
       yield* bus.publish(Event.Updated, {})
       for (let attempt = 0; attempt < 200; attempt++) {
-        if (yield* due(bufferedInput)) return
+        // A 20k buffer leaves an 80k ceiling, whose 72k trigger 80k of context passes.
+        if (yield* due(underInput)) return
         yield* Effect.sleep("10 millis")
       }
       yield* Effect.die(new Error("Timed out waiting for compaction config reload"))
@@ -176,4 +180,6 @@ const input = (tokens: number) => {
   }
 }
 const bufferedInput = input(85_000)
+/** Under the 10k buffer this sits below the 81k trigger; under the 20k buffer it is over the 72k one. */
+const underInput = input(80_000)
 const nearInput = input(95_000)

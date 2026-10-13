@@ -97,6 +97,12 @@ const SHRINK_STEPS = [0.7, 0.5, 0.35]
 const RESERVE_MIN = 16_000
 /** A common window size, assumed for the compaction request when the model's window is unknown. */
 const UNKNOWN_WINDOW = 200_000
+// T1 动态预留：为下一次回复预留 max(MIN_RESERVE_BUFFER, RESERVE_RATIO × 模型最大输出 token)，大输出模型
+// 自动获得更大余量，小输出模型以 MIN_RESERVE_BUFFER 为安全下限。可调点：RESERVE_RATIO、MIN_RESERVE_BUFFER。
+const RESERVE_RATIO = 0.25
+const MIN_RESERVE_BUFFER = 20_000
+// T1 预压缩阈值：估算占用达到可用上限的该比例即触发压缩，提前于硬限，避免真正撞窗。可调点：该比例。
+const COMPACTION_THRESHOLD = 0.9
 const TOOL_OUTPUT_MAX_CHARS = 1_250
 const IMAGE_TOKEN_ESTIMATE = 1_500
 const PDF_TOKEN_ESTIMATE = 2_000
@@ -223,9 +229,11 @@ export const layer = Layer.effect(
       const cap = Number.isFinite(ceiling)
         ? ceiling
         : calculateCeiling({ ...model.limit, context: UNKNOWN_WINDOW }, settings.buffer)
+      // T1 预压缩：压缩请求同样只瞄准可用上限的 COMPACTION_THRESHOLD，压缩后不会立刻再次逼近硬限。
+      const aim = Math.floor(cap * COMPACTION_THRESHOLD)
       // The provider just rejected this context, so the estimate ran low; the first attempt already aims below it.
       const budget =
-        trigger.reason === "overflow" ? Math.min(cap, Math.floor(estimateContext(context) * SHRINK_STEPS[0])) : cap
+        trigger.reason === "overflow" ? Math.min(aim, Math.floor(estimateContext(context) * SHRINK_STEPS[0])) : aim
 
       const selected = model === context.model ? trigger : { ...trigger, context: { ...context, model } }
       const compaction = native
@@ -247,7 +255,8 @@ export const layer = Layer.effect(
       // An encrypted native window estimates as nothing, so wait for a response to measure it.
       const measured = messages.findLastIndex((message) => hasMeasuredPrompt(message, context.model.ref))
       if (measured < messages.findLastIndex(SessionProviderContext.isCheckpoint)) return false
-      return estimateContext(context) >= ceiling
+      // T1 预压缩：达到可用上限的 COMPACTION_THRESHOLD 即触发，不等真正撞上硬限才压缩。
+      return estimateContext(context) >= Math.floor(ceiling * COMPACTION_THRESHOLD)
     }
 
     /**
@@ -898,9 +907,23 @@ export const estimatePrompt = (context: SessionContext.Loaded) => {
 }
 
 /**
+ * T1 动态预留：为模型的下一次回复预留 max(MIN_RESERVE_BUFFER, RESERVE_RATIO × 最大输出 token)，使大输出
+ * 模型自动获得更大余量。它只作为既有预留的补充（取较大值），不会回退既有语义：
+ * - 输出上限未知（0）时不追加，沿用现有的窗口比例预留；
+ * - 窗口小到给不出该预留的两倍时不追加，沿用"窗口太小就只留 10%"的既有规则；
+ * - 预留封顶在窗口一半，保证可用上限恒为正。
+ */
+const dynamicReserve = (window: number, output: number) => {
+  if (output <= 0) return 0
+  if (window < 2 * MIN_RESERVE_BUFFER) return 0
+  return Math.min(Math.max(MIN_RESERVE_BUFFER, Math.floor(RESERVE_RATIO * output)), Math.floor(window / 2))
+}
+
+/**
  * The largest request the model takes while leaving room for its reply: 10% of the window, or `RESERVE_MIN` when that
  * is more. The summary request is capped at the same size, so its output limit is whatever the reserve leaves. A window
- * too small to give up `RESERVE_MIN` keeps 10%.
+ * too small to give up `RESERVE_MIN` keeps 10%. On top of that, T1 reserves a share of the model's own output limit
+ * when the window can afford it.
  */
 const calculateCeiling = (limit: SessionContext.Loaded["model"]["limit"], buffer: number | undefined) => {
   // Unknown limits are reported as 0. An unknown input limit falls back to the context window; with no window at
@@ -908,7 +931,11 @@ const calculateCeiling = (limit: SessionContext.Loaded["model"]["limit"], buffer
   const window = limit.input || limit.context
   if (window <= 0) return Number.POSITIVE_INFINITY
   if (buffer !== undefined) return window - buffer
-  return window - Math.max(Math.floor(window * 0.1), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
+  return window - Math.max(
+    Math.floor(window * 0.1),
+    window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0,
+    dynamicReserve(window, limit.output),
+  )
 }
 
 /**

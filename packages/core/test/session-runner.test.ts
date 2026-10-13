@@ -3482,13 +3482,15 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests).toHaveLength(2)
     expect(userTexts(s.requests[0]).at(-1)).toContain("## Objective")
-    // The summary may use the whole 20k reserve of a 200k window.
-    expect(s.requests[0]?.generation?.maxTokens).toBe(20_000)
+    // The summary aims at 90% of the 180k ceiling, so 38k of the 200k window stays free: more than the 32k
+    // output limit, which the summary gets in full.
+    expect(s.requests[0]?.generation?.maxTokens).toBe(32_000)
     expect(s.requests[1]?.generation?.maxTokens).toBe(32_000)
   })
 
   scenario("keeps the summary its room on a small window", function* (s) {
-    // 90% of 64k would leave 6.4k for the summary, so the 16k reserve sets the ceiling at 48k instead.
+    // 10% of 64k would leave 6.4k for the summary and RESERVE_MIN would leave 16k, but the reply reserve floors
+    // at 20k, so the ceiling is 44k. Its 90% aim of 39.6k still leaves the summary its full 16k output limit.
     s.currentModel = smallWindowModel
     yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-small-first", 59_000))
     yield* s.runPrompt("Earlier question")
